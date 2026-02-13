@@ -7,3 +7,5 @@
 venv/
 .env
 .DS_Store
+data/*.sqlite3*
+data/*.db*
