@@ -1964,6 +1964,11 @@ def run_backtest(
     if bool(over.any()):
         weights.loc[over] = weights.loc[over].div(gross.loc[over], axis=0)
 
+    # Separate trade prices from valuation prices:
+    # - trades execute only on valid current-day quotes (>0)
+    # - portfolio valuation carries forward the last known quote across temporary gaps
+    valuation_prices = prices.astype(float).replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0)
+
     fee_rate = fee_bps / 10_000.0
     shares = pd.Series(0.0, index=prices.columns, dtype=float)
     cash = float(initial_capital)
@@ -1987,10 +1992,12 @@ def run_backtest(
 
     for dt in prices.index:
         price_row = prices.loc[dt]
+        valuation_row = valuation_prices.loc[dt]
         valid_prices = price_row.notna() & (price_row > 0)
-        px = price_row.fillna(0.0).astype(float)
+        trade_px = price_row.fillna(0.0).astype(float)
+        mark_px = valuation_row.fillna(0.0).astype(float)
 
-        current_values = shares * px
+        current_values = shares * mark_px
         portfolio_value_before = cash + float(current_values.sum())
 
         target_row = weights.loc[dt].copy()
@@ -2000,7 +2007,7 @@ def run_backtest(
             desired_shares = compute_hold_until_sell_desired_shares(
                 current_shares=current_shares,
                 target_row=target_row,
-                px=px,
+                px=mark_px,
                 valid_prices=valid_prices,
                 portfolio_value_before=portfolio_value_before,
                 max_single_position_weight=max_single_position_weight,
@@ -2025,7 +2032,7 @@ def run_backtest(
 
             desired_values = target_row * portfolio_value_before * scale
             desired_shares = current_shares.copy()
-            desired_shares.loc[valid_prices] = desired_values.loc[valid_prices].div(px.loc[valid_prices]).fillna(0.0)
+            desired_shares.loc[valid_prices] = desired_values.loc[valid_prices].div(trade_px.loc[valid_prices]).fillna(0.0)
         desired_shares = quantize_to_whole_shares(desired_shares, valid_prices)
 
         delta_shares = pd.Series(0.0, index=prices.columns, dtype=float)
@@ -2034,8 +2041,8 @@ def run_backtest(
         # No-leverage cash rule: buy-side notional (including fees) cannot exceed available cash.
         prelim_buys_mask = delta_shares > 1e-12
         prelim_sells_mask = delta_shares < -1e-12
-        prelim_buy_notional = float((delta_shares.loc[prelim_buys_mask] * px.loc[prelim_buys_mask]).sum())
-        prelim_sell_notional = float(((-delta_shares.loc[prelim_sells_mask]) * px.loc[prelim_sells_mask]).sum())
+        prelim_buy_notional = float((delta_shares.loc[prelim_buys_mask] * trade_px.loc[prelim_buys_mask]).sum())
+        prelim_sell_notional = float(((-delta_shares.loc[prelim_sells_mask]) * trade_px.loc[prelim_sells_mask]).sum())
         if prelim_buy_notional > 0:
             max_affordable_buy_notional = (cash + prelim_sell_notional * (1.0 - fee_rate)) / (1.0 + fee_rate)
             max_affordable_buy_notional = max(0.0, float(max_affordable_buy_notional))
@@ -2046,15 +2053,15 @@ def run_backtest(
                 desired_shares = quantize_to_whole_shares(desired_shares, valid_prices)
                 delta_shares.loc[valid_prices] = desired_shares.loc[valid_prices] - current_shares.loc[valid_prices]
 
-        signed_trade_values = delta_shares * px
+        signed_trade_values = delta_shares * trade_px
         abs_trade_values = signed_trade_values.abs()
         trade_notional = float(abs_trade_values.sum())
         transaction_fee = trade_notional * fee_rate
 
         buys_mask = delta_shares > 1e-12
         sells_mask = delta_shares < -1e-12
-        buy_notional = float((delta_shares.loc[buys_mask] * px.loc[buys_mask]).sum())
-        sell_notional = float(((-delta_shares.loc[sells_mask]) * px.loc[sells_mask]).sum())
+        buy_notional = float((delta_shares.loc[buys_mask] * trade_px.loc[buys_mask]).sum())
+        sell_notional = float(((-delta_shares.loc[sells_mask]) * trade_px.loc[sells_mask]).sum())
         buy_count = int(buys_mask.sum())
         sell_count = int(sells_mask.sum())
         total_trade_events += buy_count + sell_count
@@ -2064,7 +2071,7 @@ def run_backtest(
             cash = 0.0
         shares.loc[valid_prices] = desired_shares.loc[valid_prices]
 
-        end_values = shares * px
+        end_values = shares * mark_px
         portfolio_value_after = cash + float(end_values.sum())
 
         day_return = (portfolio_value_after / prev_equity - 1.0) if prev_equity > 0 else 0.0
@@ -2110,8 +2117,8 @@ def run_backtest(
                         "Ticker": ticker,
                         "Action": classify_executed_trade_action(prev_sh, new_sh),
                         "Shares": abs(delta),
-                        "Price": float(px.at[ticker]),
-                        "Trade Value": float(abs(delta * float(px.at[ticker]))),
+                        "Price": float(trade_px.at[ticker]),
+                        "Trade Value": float(abs(delta * float(trade_px.at[ticker]))),
                         "Fee": float(fee_allocation.at[ticker]),
                         "From Weight": float(from_weight.at[ticker]) if np.isfinite(from_weight.at[ticker]) else 0.0,
                         "To Weight": float(to_weight.at[ticker]) if np.isfinite(to_weight.at[ticker]) else 0.0,
@@ -2149,7 +2156,7 @@ def run_backtest(
     else:
         position_weights = pd.DataFrame(index=index, columns=prices.columns, dtype=float)
 
-    latest_prices = prices.iloc[-1].fillna(0.0)
+    latest_prices = valuation_prices.iloc[-1].fillna(0.0)
     final_equity = float(equity_series.iloc[-1]) if not equity_series.empty else float(initial_capital)
     portfolio_rows: List[Dict[str, float | str | None]] = []
     for ticker in prices.columns:
