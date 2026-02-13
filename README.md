@@ -11,6 +11,7 @@ A Streamlit app for backtesting common quantitative equity strategies with user-
 - Data layer:
   - Incremental local SQLite price store at `data/price_history.sqlite3`
   - Stores both daily close and daily volume (schema auto-upgrades if volume column was missing)
+  - Stores per-ticker fundamental snapshots (P/E, P/B, EPS) with periodic refresh
   - Uses a unified fetch path for price+volume (single query/download pass) for efficiency
   - Reuses database data when coverage exists
   - Downloads only missing date/ticker segments and upserts into the database
@@ -45,6 +46,7 @@ A Streamlit app for backtesting common quantitative equity strategies with user-
   - If holdings cap binds, candidates are ranked by signal strength and top-ranked names are selected
   - No-leverage execution rule: buy notional is capped by available cash (after same-day sells and fees)
   - Default-on illiquidity filter (minimum median dollar volume OR minimum median shares traded over configurable lookback)
+  - Optional fundamental filters (Trailing P/E, Price/Book, Trailing EPS) with a minimum-coverage guard so filtering is skipped when data is too sparse
   - Manual ticker exclusion list (ignore selected stocks during backtest)
   - Strategy-specific parameters
   - Optional stop loss (disabled unless explicitly enabled)
@@ -74,6 +76,7 @@ streamlit run app.py
 
 ## Notes
 - Data source: Yahoo Finance via `yfinance`.
+- Fundamental metrics are point-in-time snapshots from Yahoo Finance and can be missing for some symbols (especially non-equities and loss-making names); the app can skip fundamental filtering if selected metrics fail the configured coverage threshold.
 - Backtest execution uses a 1-trading-day signal lag to reduce lookahead bias.
 - Trades are executed in whole shares only (no fractional shares).
 - Strategies never allocate to NaN/zero-price assets; execution also blocks trades when price is non-positive.

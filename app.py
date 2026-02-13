@@ -79,6 +79,16 @@ DB_COVERAGE_TOLERANCE_DAYS = 3
 DB_REFRESH_LOOKBACK_DAYS = 7
 DELISTING_CONFIRMATION_DAYS = 20
 EARLIEST_DATE_INPUT = date(1900, 1, 1)
+FUNDAMENTAL_REFRESH_DAYS = 7
+DEFAULT_FUNDAMENTAL_MIN_COVERAGE = 0.70
+FUNDAMENTAL_METRIC_LABELS: Dict[str, str] = {
+    "trailing_pe": "Trailing P/E",
+    "forward_pe": "Forward P/E",
+    "price_to_book": "Price/Book",
+    "trailing_eps": "Trailing EPS",
+    "forward_eps": "Forward EPS",
+}
+FUNDAMENTAL_METRIC_ORDER: Tuple[str, ...] = tuple(FUNDAMENTAL_METRIC_LABELS.keys())
 
 PRESET_UNIVERSES: Dict[str, List[str]] = {
     "Dow 30": [
@@ -267,6 +277,56 @@ def parse_tickers(text: str) -> List[str]:
         return []
     raw = re.split(r"[\s,;]+", text.upper())
     return normalize_ticker_list([ticker.strip() for ticker in raw if ticker.strip()])
+
+
+def to_finite_float(value: Any) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return np.nan
+    return numeric if np.isfinite(numeric) else np.nan
+
+
+def clean_positive_ratio(value: Any) -> float:
+    numeric = to_finite_float(value)
+    if pd.notna(numeric) and numeric > 0:
+        return float(numeric)
+    return np.nan
+
+
+def sanitize_fundamental_metric_series(values: pd.Series, metric: str) -> pd.Series:
+    numeric = pd.to_numeric(values, errors="coerce")
+    numeric = numeric.where(np.isfinite(numeric))
+    if metric in {"trailing_pe", "forward_pe", "price_to_book"}:
+        numeric = numeric.where(numeric > 0)
+    return numeric
+
+
+def format_fundamental_filter_description(metric_filters: Dict[str, Dict[str, float]]) -> str:
+    parts: List[str] = []
+    for metric in FUNDAMENTAL_METRIC_ORDER:
+        bounds = metric_filters.get(metric)
+        if not bounds:
+            continue
+        label = FUNDAMENTAL_METRIC_LABELS.get(metric, metric)
+        min_value = bounds.get("min")
+        max_value = bounds.get("max")
+        if min_value is not None and max_value is not None:
+            parts.append(f"{label} in [{float(min_value):.2f}, {float(max_value):.2f}]")
+        elif min_value is not None:
+            parts.append(f"{label} >= {float(min_value):.2f}")
+        elif max_value is not None:
+            parts.append(f"{label} <= {float(max_value):.2f}")
+    return "; ".join(parts)
+
+
+def format_fundamental_coverage_summary(metric_coverage: Dict[str, float]) -> str:
+    parts: List[str] = []
+    for metric in FUNDAMENTAL_METRIC_ORDER:
+        if metric in metric_coverage:
+            label = FUNDAMENTAL_METRIC_LABELS.get(metric, metric)
+            parts.append(f"{label}: {100.0 * float(metric_coverage[metric]):.0f}%")
+    return ", ".join(parts)
 
 
 def parse_ishares_holdings_tickers(url: str) -> List[str]:
@@ -677,6 +737,21 @@ def init_price_database() -> None:
         if "volume" not in columns:
             conn.execute("ALTER TABLE daily_prices ADD COLUMN volume REAL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_prices_date ON daily_prices (date)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fundamentals_snapshot (
+                ticker TEXT PRIMARY KEY,
+                asof_date TEXT NOT NULL,
+                trailing_pe REAL,
+                forward_pe REAL,
+                price_to_book REAL,
+                trailing_eps REAL,
+                forward_eps REAL,
+                quote_type TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_fundamentals_asof_date ON fundamentals_snapshot (asof_date)")
         conn.commit()
 
 
@@ -726,6 +801,197 @@ def download_prices_from_yfinance(tickers: Tuple[str, ...], start: str, end: str
 def download_volumes_from_yfinance(tickers: Tuple[str, ...], start: str, end: str) -> pd.DataFrame:
     _, volume = download_market_data_from_yfinance(tickers, start, end)
     return volume
+
+
+def fetch_fundamentals_from_yfinance(tickers: Tuple[str, ...]) -> pd.DataFrame:
+    if not tickers:
+        return pd.DataFrame(
+            columns=["ticker", "asof_date", "trailing_pe", "forward_pe", "price_to_book", "trailing_eps", "forward_eps", "quote_type"]
+        )
+
+    asof_date = pd.Timestamp.utcnow().tz_localize(None).normalize().strftime("%Y-%m-%d")
+    rows: List[Dict[str, Any]] = []
+    for ticker in tickers:
+        info: Dict[str, Any] = {}
+        try:
+            info = yf.Ticker(ticker).get_info() or {}
+        except Exception:
+            info = {}
+
+        rows.append(
+            {
+                "ticker": str(ticker).upper(),
+                "asof_date": asof_date,
+                "trailing_pe": clean_positive_ratio(info.get("trailingPE")),
+                "forward_pe": clean_positive_ratio(info.get("forwardPE")),
+                "price_to_book": clean_positive_ratio(info.get("priceToBook")),
+                "trailing_eps": to_finite_float(info.get("trailingEps", info.get("epsTrailingTwelveMonths"))),
+                "forward_eps": to_finite_float(info.get("forwardEps", info.get("epsForward"))),
+                "quote_type": str(info.get("quoteType", "")).strip().upper(),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def read_fundamentals_from_database(conn: sqlite3.Connection, tickers: Tuple[str, ...]) -> pd.DataFrame:
+    if not tickers:
+        return pd.DataFrame(columns=["asof_date", *FUNDAMENTAL_METRIC_ORDER, "quote_type"])
+
+    placeholders = ",".join(["?"] * len(tickers))
+    query = (
+        f"SELECT ticker, asof_date, trailing_pe, forward_pe, price_to_book, trailing_eps, forward_eps, quote_type "
+        f"FROM fundamentals_snapshot WHERE ticker IN ({placeholders})"
+    )
+    rows = pd.read_sql_query(query, conn, params=list(tickers))
+    if rows.empty:
+        return pd.DataFrame(columns=["asof_date", *FUNDAMENTAL_METRIC_ORDER, "quote_type"], index=pd.Index([], name="ticker"))
+
+    rows["ticker"] = rows["ticker"].astype(str).str.upper()
+    rows["asof_date"] = pd.to_datetime(rows["asof_date"], errors="coerce")
+    for metric in FUNDAMENTAL_METRIC_ORDER:
+        if metric in rows.columns:
+            rows[metric] = sanitize_fundamental_metric_series(rows[metric], metric)
+    rows = rows.set_index("ticker").sort_index()
+    return rows.reindex(list(tickers))
+
+
+def upsert_fundamentals_into_database(conn: sqlite3.Connection, fundamentals: pd.DataFrame) -> int:
+    if fundamentals.empty:
+        return 0
+
+    records: List[Tuple[str, str, float | None, float | None, float | None, float | None, float | None, str | None]] = []
+    for _, row in fundamentals.iterrows():
+        ticker = str(row.get("ticker", "")).strip().upper()
+        if not ticker:
+            continue
+        asof_raw = row.get("asof_date", pd.Timestamp.utcnow().tz_localize(None).normalize())
+        asof_date = pd.Timestamp(asof_raw).strftime("%Y-%m-%d")
+        trailing_pe = to_finite_float(row.get("trailing_pe"))
+        forward_pe = to_finite_float(row.get("forward_pe"))
+        price_to_book = to_finite_float(row.get("price_to_book"))
+        trailing_eps = to_finite_float(row.get("trailing_eps"))
+        forward_eps = to_finite_float(row.get("forward_eps"))
+        quote_type = str(row.get("quote_type", "")).strip().upper() or None
+        records.append(
+            (
+                ticker,
+                asof_date,
+                float(trailing_pe) if pd.notna(trailing_pe) else None,
+                float(forward_pe) if pd.notna(forward_pe) else None,
+                float(price_to_book) if pd.notna(price_to_book) else None,
+                float(trailing_eps) if pd.notna(trailing_eps) else None,
+                float(forward_eps) if pd.notna(forward_eps) else None,
+                quote_type,
+            )
+        )
+
+    if not records:
+        return 0
+
+    conn.executemany(
+        """
+        INSERT INTO fundamentals_snapshot (
+            ticker, asof_date, trailing_pe, forward_pe, price_to_book, trailing_eps, forward_eps, quote_type
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(ticker) DO UPDATE SET
+            asof_date = excluded.asof_date,
+            trailing_pe = excluded.trailing_pe,
+            forward_pe = excluded.forward_pe,
+            price_to_book = excluded.price_to_book,
+            trailing_eps = excluded.trailing_eps,
+            forward_eps = excluded.forward_eps,
+            quote_type = excluded.quote_type
+        """,
+        records,
+    )
+    conn.commit()
+    return len(records)
+
+
+def download_fundamental_data(tickers: Tuple[str, ...], refresh_days: int = FUNDAMENTAL_REFRESH_DAYS) -> pd.DataFrame:
+    normalized_tickers = tuple(normalize_ticker_list(list(tickers)))
+    if not normalized_tickers:
+        return pd.DataFrame(columns=["asof_date", *FUNDAMENTAL_METRIC_ORDER, "quote_type"])
+
+    refresh_days = max(1, int(refresh_days))
+    stale_cutoff = pd.Timestamp.utcnow().tz_localize(None).normalize() - pd.Timedelta(days=refresh_days)
+    init_price_database()
+
+    with get_price_database_connection() as conn:
+        db_fundamentals = read_fundamentals_from_database(conn, normalized_tickers)
+        stale_tickers: List[str] = []
+        for ticker in normalized_tickers:
+            if ticker not in db_fundamentals.index:
+                stale_tickers.append(ticker)
+                continue
+            asof_value = db_fundamentals.at[ticker, "asof_date"] if "asof_date" in db_fundamentals.columns else pd.NaT
+            if pd.isna(asof_value) or pd.Timestamp(asof_value) < stale_cutoff:
+                stale_tickers.append(ticker)
+
+        if stale_tickers:
+            fetched = fetch_fundamentals_from_yfinance(tuple(stale_tickers))
+            if not fetched.empty:
+                upsert_fundamentals_into_database(conn, fetched)
+            db_fundamentals = read_fundamentals_from_database(conn, normalized_tickers)
+
+    if db_fundamentals.empty:
+        empty = pd.DataFrame(index=list(normalized_tickers), columns=["asof_date", *FUNDAMENTAL_METRIC_ORDER, "quote_type"])
+        empty.index.name = "ticker"
+        return empty
+    return db_fundamentals.reindex(list(normalized_tickers))
+
+
+def filter_stocks_by_fundamentals(
+    prices: pd.DataFrame,
+    fundamentals: pd.DataFrame,
+    metric_filters: Dict[str, Dict[str, float]],
+    min_coverage: float,
+) -> Tuple[pd.DataFrame, List[str], List[str], Dict[str, float], List[str], bool]:
+    if prices.empty or not metric_filters:
+        return prices, [], [], {}, [], False
+
+    min_coverage = float(np.clip(float(min_coverage), 0.0, 1.0))
+    tickers = list(prices.columns)
+    aligned_fundamentals = fundamentals.reindex(tickers)
+
+    metric_coverage: Dict[str, float] = {}
+    low_coverage_metrics: List[str] = []
+    denominator = max(1, len(tickers))
+
+    for metric in metric_filters:
+        if metric not in aligned_fundamentals.columns:
+            metric_coverage[metric] = 0.0
+            low_coverage_metrics.append(metric)
+            continue
+        sanitized = sanitize_fundamental_metric_series(aligned_fundamentals[metric], metric)
+        coverage = float(sanitized.notna().sum()) / float(denominator)
+        metric_coverage[metric] = coverage
+        if coverage < min_coverage:
+            low_coverage_metrics.append(metric)
+
+    if low_coverage_metrics:
+        return prices, [], [], metric_coverage, sorted(low_coverage_metrics), False
+
+    pass_mask = pd.Series(True, index=tickers, dtype=bool)
+    missing_mask = pd.Series(False, index=tickers, dtype=bool)
+    for metric, bounds in metric_filters.items():
+        values = sanitize_fundamental_metric_series(aligned_fundamentals[metric], metric).reindex(tickers)
+        metric_pass = values.notna()
+        missing_mask = missing_mask | values.isna()
+        min_value = bounds.get("min")
+        max_value = bounds.get("max")
+        if min_value is not None:
+            metric_pass = metric_pass & (values >= float(min_value))
+        if max_value is not None:
+            metric_pass = metric_pass & (values <= float(max_value))
+        pass_mask = pass_mask & metric_pass.fillna(False)
+
+    filtered = prices.loc[:, pass_mask]
+    excluded_tickers = sorted(pass_mask.index[~pass_mask].tolist())
+    missing_tickers = sorted(missing_mask.index[missing_mask].tolist())
+    return filtered, excluded_tickers, missing_tickers, metric_coverage, [], True
 
 
 def filter_illiquid_stocks(
@@ -2989,6 +3255,78 @@ def render_strategy_params(strategy_name: str, selected_tickers: List[str], pref
     return params
 
 
+def render_fundamental_filter_controls(prefix: str) -> Tuple[Dict[str, Dict[str, float]], float]:
+    metric_filters: Dict[str, Dict[str, float]] = {}
+    enable_filter = st.toggle(
+        "Filter by fundamentals (P/E, P/B, EPS)",
+        value=False,
+        key=widget_key(prefix, "enable_fundamental_filter"),
+    )
+    if not enable_filter:
+        return metric_filters, DEFAULT_FUNDAMENTAL_MIN_COVERAGE
+
+    min_coverage_pct = st.slider(
+        "Min metric coverage to apply filter (%)",
+        min_value=50,
+        max_value=100,
+        value=int(DEFAULT_FUNDAMENTAL_MIN_COVERAGE * 100),
+        step=5,
+        key=widget_key(prefix, "fundamental_min_coverage_pct"),
+    )
+    st.caption("If enabled metrics are below this coverage threshold, fundamental filtering is skipped for reliability.")
+
+    use_trailing_pe = st.checkbox("Apply trailing P/E range", value=False, key=widget_key(prefix, "use_trailing_pe_filter"))
+    if use_trailing_pe:
+        trailing_pe_min = st.number_input(
+            "Trailing P/E min",
+            min_value=0.0,
+            max_value=500.0,
+            value=0.0,
+            step=0.5,
+            key=widget_key(prefix, "trailing_pe_min"),
+        )
+        trailing_pe_max = st.number_input(
+            "Trailing P/E max",
+            min_value=0.0,
+            max_value=500.0,
+            value=30.0,
+            step=0.5,
+            key=widget_key(prefix, "trailing_pe_max"),
+        )
+        if float(trailing_pe_max) < float(trailing_pe_min):
+            trailing_pe_min, trailing_pe_max = trailing_pe_max, trailing_pe_min
+        metric_filters["trailing_pe"] = {"min": float(trailing_pe_min), "max": float(trailing_pe_max)}
+
+    use_price_to_book = st.checkbox("Apply max price/book", value=False, key=widget_key(prefix, "use_price_to_book_filter"))
+    if use_price_to_book:
+        price_to_book_max = st.number_input(
+            "Price/Book max",
+            min_value=0.0,
+            max_value=100.0,
+            value=8.0,
+            step=0.1,
+            key=widget_key(prefix, "price_to_book_max"),
+        )
+        metric_filters["price_to_book"] = {"max": float(price_to_book_max)}
+
+    use_trailing_eps = st.checkbox("Apply min trailing EPS", value=False, key=widget_key(prefix, "use_trailing_eps_filter"))
+    if use_trailing_eps:
+        trailing_eps_min = st.number_input(
+            "Trailing EPS min",
+            min_value=-100.0,
+            max_value=1000.0,
+            value=0.0,
+            step=0.1,
+            key=widget_key(prefix, "trailing_eps_min"),
+        )
+        metric_filters["trailing_eps"] = {"min": float(trailing_eps_min)}
+
+    if not metric_filters:
+        st.caption("No fundamental thresholds selected yet.")
+
+    return metric_filters, float(min_coverage_pct) / 100.0
+
+
 def download_and_filter_prices(
     selected_tickers: List[str],
     start_date: date,
@@ -2997,13 +3335,31 @@ def download_and_filter_prices(
     min_median_dollar_volume: float,
     min_median_share_volume: float,
     liquidity_lookback_days: int,
-) -> Tuple[pd.DataFrame, List[str], List[str], List[str], List[str], bool]:
+    fundamental_metric_filters: Dict[str, Dict[str, float]] | None = None,
+    min_fundamental_coverage: float = DEFAULT_FUNDAMENTAL_MIN_COVERAGE,
+) -> Dict[str, Any]:
+    fundamental_metric_filters = fundamental_metric_filters or {}
+    result: Dict[str, Any] = {
+        "prices": pd.DataFrame(),
+        "missing_tickers": [],
+        "limited_history_tickers": [],
+        "illiquid_tickers": [],
+        "no_volume_tickers": [],
+        "liquidity_filter_applied": False,
+        "fundamental_filter_requested": False,
+        "fundamental_filter_applied": False,
+        "fundamental_filtered_tickers": [],
+        "fundamental_missing_tickers": [],
+        "fundamental_low_coverage_metrics": [],
+        "fundamental_metric_coverage": {},
+    }
     prices, volumes = download_price_volume_data(tuple(selected_tickers), start_date.isoformat(), end_date.isoformat())
     if prices.empty:
-        return pd.DataFrame(), [], [], [], [], False
+        return result
 
     downloaded_before_filter = list(prices.columns)
     missing_tickers = sorted(set(selected_tickers) - set(downloaded_before_filter))
+    result["missing_tickers"] = missing_tickers
 
     illiquid_tickers: List[str] = []
     no_volume_tickers: List[str] = []
@@ -3017,12 +3373,48 @@ def download_and_filter_prices(
             lookback_days=liquidity_lookback_days,
         )
         if prices.empty:
-            return pd.DataFrame(), missing_tickers, [], illiquid_tickers, no_volume_tickers, liquidity_filter_applied
+            result["prices"] = pd.DataFrame()
+            result["illiquid_tickers"] = illiquid_tickers
+            result["no_volume_tickers"] = no_volume_tickers
+            result["liquidity_filter_applied"] = liquidity_filter_applied
+            return result
+
+    result["illiquid_tickers"] = illiquid_tickers
+    result["no_volume_tickers"] = no_volume_tickers
+    result["liquidity_filter_applied"] = liquidity_filter_applied
+
+    if fundamental_metric_filters and not prices.empty:
+        result["fundamental_filter_requested"] = True
+        fundamentals = download_fundamental_data(tuple(prices.columns))
+        (
+            prices,
+            fundamental_filtered_tickers,
+            fundamental_missing_tickers,
+            fundamental_metric_coverage,
+            fundamental_low_coverage_metrics,
+            fundamental_filter_applied,
+        ) = filter_stocks_by_fundamentals(
+            prices=prices,
+            fundamentals=fundamentals,
+            metric_filters=fundamental_metric_filters,
+            min_coverage=min_fundamental_coverage,
+        )
+        result["fundamental_filter_applied"] = bool(fundamental_filter_applied)
+        result["fundamental_filtered_tickers"] = fundamental_filtered_tickers
+        result["fundamental_missing_tickers"] = fundamental_missing_tickers
+        result["fundamental_low_coverage_metrics"] = fundamental_low_coverage_metrics
+        result["fundamental_metric_coverage"] = fundamental_metric_coverage
+
+        if prices.empty:
+            result["prices"] = pd.DataFrame()
+            return result
 
     min_obs = min(len(prices), max(40, int(0.40 * len(prices))))
     positive_obs = (prices > 0).sum(axis=0)
     limited_history_tickers = sorted([ticker for ticker in prices.columns if int(positive_obs.get(ticker, 0)) < min_obs])
-    return prices, missing_tickers, limited_history_tickers, illiquid_tickers, no_volume_tickers, liquidity_filter_applied
+    result["prices"] = prices
+    result["limited_history_tickers"] = limited_history_tickers
+    return result
 
 
 def build_live_signal_table(
@@ -3610,6 +4002,7 @@ def render_backtest_page() -> None:
             min_median_dollar_volume_m = 2.0
             min_median_share_volume_m = 1.0
             liquidity_lookback_days = 60
+        fundamental_metric_filters, min_fundamental_coverage = render_fundamental_filter_controls("bt")
         st.caption("Backtest uses a 1-trading-day execution lag (signals from t-1 executed on t) to reduce lookahead bias.")
         st.caption("Safety rule: strategy signals and executions ignore NaN/zero-price assets.")
         st.caption("No leverage rule: buys are cash-constrained each day (cannot spend more than available cash after same-day sells and fees).")
@@ -3671,6 +4064,11 @@ def render_backtest_page() -> None:
             "min_median_dollar_volume_m": float(min_median_dollar_volume_m),
             "min_median_share_volume_m": float(min_median_share_volume_m),
             "liquidity_lookback_days": int(liquidity_lookback_days),
+            "fundamental_metric_filters": tuple(
+                (metric, tuple(sorted((str(k), float(v)) for k, v in bounds.items())))
+                for metric, bounds in sorted(fundamental_metric_filters.items())
+            ),
+            "min_fundamental_coverage": float(min_fundamental_coverage),
             "position_side": position_side,
             "weighting_scheme": weighting_scheme,
             "weighting_vol_window": int(weighting_vol_window),
@@ -3697,7 +4095,7 @@ def render_backtest_page() -> None:
 
         if valid_inputs:
             with st.spinner("Downloading historical prices..."):
-                prices, missing_tickers, limited_history_tickers, illiquid_tickers, no_volume_tickers, liquidity_filter_applied = download_and_filter_prices(
+                download_result = download_and_filter_prices(
                     selected_tickers=selected_tickers,
                     start_date=start_date,
                     end_date=end_date,
@@ -3705,11 +4103,25 @@ def render_backtest_page() -> None:
                     min_median_dollar_volume=float(min_median_dollar_volume_m) * 1_000_000.0,
                     min_median_share_volume=float(min_median_share_volume_m) * 1_000_000.0,
                     liquidity_lookback_days=int(liquidity_lookback_days),
+                    fundamental_metric_filters=fundamental_metric_filters,
+                    min_fundamental_coverage=float(min_fundamental_coverage),
                 )
+            prices = download_result["prices"]
+            missing_tickers = download_result["missing_tickers"]
+            limited_history_tickers = download_result["limited_history_tickers"]
+            illiquid_tickers = download_result["illiquid_tickers"]
+            no_volume_tickers = download_result["no_volume_tickers"]
+            liquidity_filter_applied = bool(download_result["liquidity_filter_applied"])
+            fundamental_filter_requested = bool(download_result["fundamental_filter_requested"])
+            fundamental_filter_applied = bool(download_result["fundamental_filter_applied"])
+            fundamental_filtered_tickers = download_result["fundamental_filtered_tickers"]
+            fundamental_missing_tickers = download_result["fundamental_missing_tickers"]
+            fundamental_low_coverage_metrics = download_result["fundamental_low_coverage_metrics"]
+            fundamental_metric_coverage = download_result["fundamental_metric_coverage"]
             if prices.empty:
                 st.error(
                     "No valid price data returned after applying filters. "
-                    "Try a broader universe/date range or relax the liquidity threshold."
+                    "Try a broader universe/date range or relax liquidity/fundamental filters."
                 )
                 valid_inputs = False
 
@@ -3791,6 +4203,14 @@ def render_backtest_page() -> None:
                 "min_median_dollar_volume_m": float(min_median_dollar_volume_m),
                 "min_median_share_volume_m": float(min_median_share_volume_m),
                 "liquidity_lookback_days": int(liquidity_lookback_days),
+                "fundamental_metric_filters": fundamental_metric_filters,
+                "min_fundamental_coverage": float(min_fundamental_coverage),
+                "fundamental_filter_requested": fundamental_filter_requested,
+                "fundamental_filter_applied": fundamental_filter_applied,
+                "fundamental_filtered_tickers": fundamental_filtered_tickers,
+                "fundamental_missing_tickers": fundamental_missing_tickers,
+                "fundamental_low_coverage_metrics": fundamental_low_coverage_metrics,
+                "fundamental_metric_coverage": fundamental_metric_coverage,
                 "position_side": position_side,
                 "weighting_scheme": weighting_scheme,
                 "weighting_vol_window": int(weighting_vol_window),
@@ -3810,6 +4230,8 @@ def render_backtest_page() -> None:
                     "execution_style": execution_style,
                     "max_single_position_cap_pct": float(max_single_position_cap_pct),
                     "max_portfolio_holdings": int(max_portfolio_holdings),
+                    "fundamental_filter_requested": bool(fundamental_filter_requested),
+                    "fundamental_filter_applied": bool(fundamental_filter_applied),
                     "benchmark_count": int(len(benchmark_results)),
                 },
                 "strategy_result": strategy_result,
@@ -3834,6 +4256,14 @@ def render_backtest_page() -> None:
     min_median_dollar_volume_m_for_run = float(result_bundle.get("min_median_dollar_volume_m", 0.0))
     min_median_share_volume_m_for_run = float(result_bundle.get("min_median_share_volume_m", 0.0))
     liquidity_lookback_days_for_run = int(result_bundle.get("liquidity_lookback_days", 60))
+    fundamental_metric_filters_for_run = result_bundle.get("fundamental_metric_filters", {})
+    min_fundamental_coverage_for_run = float(result_bundle.get("min_fundamental_coverage", DEFAULT_FUNDAMENTAL_MIN_COVERAGE))
+    fundamental_filter_requested_for_run = bool(result_bundle.get("fundamental_filter_requested", False))
+    fundamental_filter_applied_for_run = bool(result_bundle.get("fundamental_filter_applied", False))
+    fundamental_filtered_tickers_for_run = result_bundle.get("fundamental_filtered_tickers", [])
+    fundamental_missing_tickers_for_run = result_bundle.get("fundamental_missing_tickers", [])
+    fundamental_low_coverage_metrics_for_run = result_bundle.get("fundamental_low_coverage_metrics", [])
+    fundamental_metric_coverage_for_run = result_bundle.get("fundamental_metric_coverage", {})
     position_side_for_run = str(result_bundle.get("position_side", "Long Only"))
     weighting_scheme_for_run = str(result_bundle.get("weighting_scheme", "Equal Weight"))
     weighting_vol_window_for_run = int(result_bundle.get("weighting_vol_window", 20))
@@ -3905,6 +4335,41 @@ def render_backtest_page() -> None:
                 )
         else:
             st.info("Illiquidity filter requested, but volume data was unavailable so no liquidity-based exclusion was applied.")
+    if fundamental_filter_requested_for_run:
+        filter_description = format_fundamental_filter_description(fundamental_metric_filters_for_run)
+        coverage_summary = format_fundamental_coverage_summary(fundamental_metric_coverage_for_run)
+        if fundamental_filter_applied_for_run:
+            st.caption(
+                f"Fundamental filter ON ({filter_description}) with min required metric coverage "
+                f"{100.0 * float(min_fundamental_coverage_for_run):.0f}%."
+            )
+            if coverage_summary:
+                st.caption(f"Fundamental data coverage: {coverage_summary}.")
+            if fundamental_filtered_tickers_for_run:
+                st.warning(
+                    f"Excluded {len(fundamental_filtered_tickers_for_run)} ticker(s) by fundamental thresholds: "
+                    f"{', '.join(fundamental_filtered_tickers_for_run[:40])}{'...' if len(fundamental_filtered_tickers_for_run) > 40 else ''}"
+                )
+            if fundamental_missing_tickers_for_run:
+                st.caption(
+                    f"Tickers excluded due to missing fundamental values in enabled metrics: "
+                    f"{', '.join(fundamental_missing_tickers_for_run[:40])}{'...' if len(fundamental_missing_tickers_for_run) > 40 else ''}"
+                )
+        else:
+            low_coverage_text = ", ".join(
+                [
+                    f"{FUNDAMENTAL_METRIC_LABELS.get(metric, metric)} "
+                    f"({100.0 * float(fundamental_metric_coverage_for_run.get(metric, 0.0)):.0f}%)"
+                    for metric in fundamental_low_coverage_metrics_for_run
+                ]
+            )
+            if low_coverage_text:
+                st.info(
+                    f"Fundamental filter skipped for reliability: coverage below "
+                    f"{100.0 * float(min_fundamental_coverage_for_run):.0f}% for {low_coverage_text}."
+                )
+                if coverage_summary:
+                    st.caption(f"Fundamental data coverage: {coverage_summary}.")
     if limited_history_tickers:
         st.info(
             f"{len(limited_history_tickers)} ticker(s) have limited positive-price history (often IPO/new listing) and were kept in the test. "
@@ -4045,6 +4510,7 @@ def render_live_signals_page() -> None:
             min_median_dollar_volume_m = 2.0
             min_median_share_volume_m = 1.0
             liquidity_lookback_days = 60
+        fundamental_metric_filters, min_fundamental_coverage = render_fundamental_filter_controls("live")
         start_date = as_of_date - timedelta(days=int(365.25 * lookback_years))
         st.caption("Safety rule: strategy signals and executions ignore NaN/zero-price assets.")
         st.caption("No leverage rule: live execution model is cash-constrained (buys cannot exceed available cash after sells and fees).")
@@ -4101,7 +4567,7 @@ def render_live_signals_page() -> None:
         return
 
     with st.spinner("Downloading latest historical prices..."):
-        prices, missing_tickers, limited_history_tickers, illiquid_tickers, no_volume_tickers, liquidity_filter_applied = download_and_filter_prices(
+        download_result = download_and_filter_prices(
             selected_tickers=selected_tickers,
             start_date=start_date,
             end_date=as_of_date,
@@ -4109,11 +4575,25 @@ def render_live_signals_page() -> None:
             min_median_dollar_volume=float(min_median_dollar_volume_m) * 1_000_000.0,
             min_median_share_volume=float(min_median_share_volume_m) * 1_000_000.0,
             liquidity_lookback_days=int(liquidity_lookback_days),
+            fundamental_metric_filters=fundamental_metric_filters,
+            min_fundamental_coverage=float(min_fundamental_coverage),
         )
+    prices = download_result["prices"]
+    missing_tickers = download_result["missing_tickers"]
+    limited_history_tickers = download_result["limited_history_tickers"]
+    illiquid_tickers = download_result["illiquid_tickers"]
+    no_volume_tickers = download_result["no_volume_tickers"]
+    liquidity_filter_applied = bool(download_result["liquidity_filter_applied"])
+    fundamental_filter_requested = bool(download_result["fundamental_filter_requested"])
+    fundamental_filter_applied = bool(download_result["fundamental_filter_applied"])
+    fundamental_filtered_tickers = download_result["fundamental_filtered_tickers"]
+    fundamental_missing_tickers = download_result["fundamental_missing_tickers"]
+    fundamental_low_coverage_metrics = download_result["fundamental_low_coverage_metrics"]
+    fundamental_metric_coverage = download_result["fundamental_metric_coverage"]
     if prices.empty:
         st.error(
             "No valid price data returned after applying filters. "
-            "Try a broader universe/date range or relax the liquidity threshold."
+            "Try a broader universe/date range or relax liquidity/fundamental filters."
         )
         return
 
@@ -4141,6 +4621,41 @@ def render_live_signals_page() -> None:
                 )
         else:
             st.info("Illiquidity filter requested, but volume data was unavailable so no liquidity-based exclusion was applied.")
+    if fundamental_filter_requested:
+        filter_description = format_fundamental_filter_description(fundamental_metric_filters)
+        coverage_summary = format_fundamental_coverage_summary(fundamental_metric_coverage)
+        if fundamental_filter_applied:
+            st.caption(
+                f"Fundamental filter ON ({filter_description}) with min required metric coverage "
+                f"{100.0 * float(min_fundamental_coverage):.0f}%."
+            )
+            if coverage_summary:
+                st.caption(f"Fundamental data coverage: {coverage_summary}.")
+            if fundamental_filtered_tickers:
+                st.warning(
+                    f"Excluded {len(fundamental_filtered_tickers)} ticker(s) by fundamental thresholds: "
+                    f"{', '.join(fundamental_filtered_tickers[:40])}{'...' if len(fundamental_filtered_tickers) > 40 else ''}"
+                )
+            if fundamental_missing_tickers:
+                st.caption(
+                    f"Tickers excluded due to missing fundamental values in enabled metrics: "
+                    f"{', '.join(fundamental_missing_tickers[:40])}{'...' if len(fundamental_missing_tickers) > 40 else ''}"
+                )
+        else:
+            low_coverage_text = ", ".join(
+                [
+                    f"{FUNDAMENTAL_METRIC_LABELS.get(metric, metric)} "
+                    f"({100.0 * float(fundamental_metric_coverage.get(metric, 0.0)):.0f}%)"
+                    for metric in fundamental_low_coverage_metrics
+                ]
+            )
+            if low_coverage_text:
+                st.info(
+                    f"Fundamental filter skipped for reliability: coverage below "
+                    f"{100.0 * float(min_fundamental_coverage):.0f}% for {low_coverage_text}."
+                )
+                if coverage_summary:
+                    st.caption(f"Fundamental data coverage: {coverage_summary}.")
     if limited_history_tickers:
         st.info(
             f"{len(limited_history_tickers)} ticker(s) have limited positive-price history (often IPO/new listing). "
