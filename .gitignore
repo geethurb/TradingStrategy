@@ -9,3 +9,4 @@ venv/
 .DS_Store
 data/*.sqlite3*
 data/*.db*
+!data/price_history.sqlite3
