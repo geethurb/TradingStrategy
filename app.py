@@ -3,7 +3,8 @@
 import re
 import io
 import sqlite3
-from datetime import date, timedelta
+import time
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -14,6 +15,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 from bs4 import BeautifulSoup
+from yfinance.exceptions import YFRateLimitError
 
 TRADING_DAYS_PER_YEAR = 252
 REBALANCE_FREQ_MAP = {
@@ -89,6 +91,13 @@ FUNDAMENTAL_METRIC_LABELS: Dict[str, str] = {
     "forward_eps": "Forward EPS",
 }
 FUNDAMENTAL_METRIC_ORDER: Tuple[str, ...] = tuple(FUNDAMENTAL_METRIC_LABELS.keys())
+INCOMPLETE_DAY_MIN_CLOSE_COVERAGE = 0.98
+INCOMPLETE_DAY_MIN_VOLUME_COVERAGE = 0.95
+INCOMPLETE_DAY_RELATIVE_COVERAGE = 0.98
+YF_DOWNLOAD_MAX_RETRIES = 4
+YF_DOWNLOAD_BACKOFF_SECONDS = 2.0
+YF_TICKER_INFO_MAX_RETRIES = 3
+YF_TICKER_INFO_BACKOFF_SECONDS = 1.5
 
 PRESET_UNIVERSES: Dict[str, List[str]] = {
     "Dow 30": [
@@ -719,8 +728,35 @@ def get_rebalance_dates(index: pd.DatetimeIndex, frequency: str) -> List[pd.Time
     return rebalance_dates
 
 
+def ensure_valid_sqlite_file(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+
+    try:
+        header = path.read_bytes()[:16]
+    except OSError:
+        header = b""
+
+    is_sqlite_header = header == b"SQLite format 3\x00"
+    if is_sqlite_header:
+        try:
+            with sqlite3.connect(path, timeout=5) as conn:
+                conn.execute("PRAGMA schema_version;").fetchone()
+            return None
+        except sqlite3.DatabaseError:
+            pass
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    backup_path = path.with_name(f"{path.stem}.corrupt_{timestamp}{path.suffix}")
+    path.replace(backup_path)
+    return backup_path
+
+
 def init_price_database() -> None:
     PRICE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    moved_path = ensure_valid_sqlite_file(PRICE_DB_PATH)
+    if moved_path is not None:
+        print(f"[warning] Replaced invalid database file '{PRICE_DB_PATH}' with new SQLite DB. Backup: '{moved_path}'.")
     with sqlite3.connect(PRICE_DB_PATH, timeout=30) as conn:
         conn.execute(
             """
@@ -762,19 +798,57 @@ def get_price_database_connection() -> sqlite3.Connection:
     return conn
 
 
+def download_raw_from_yfinance_with_retry(tickers: Tuple[str, ...], start: str, end: str) -> pd.DataFrame:
+    end_plus_one = (pd.Timestamp(end) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    last_error: Exception | None = None
+    for attempt in range(int(YF_DOWNLOAD_MAX_RETRIES)):
+        try:
+            return yf.download(
+                tickers=list(tickers),
+                start=start,
+                end=end_plus_one,
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+            )
+        except YFRateLimitError as exc:
+            last_error = exc
+            if attempt < int(YF_DOWNLOAD_MAX_RETRIES) - 1:
+                time.sleep(float(YF_DOWNLOAD_BACKOFF_SECONDS) * float(attempt + 1))
+        except Exception as exc:
+            last_error = exc
+            if attempt < int(YF_DOWNLOAD_MAX_RETRIES) - 1:
+                time.sleep(0.5 * float(attempt + 1))
+
+    if isinstance(last_error, YFRateLimitError):
+        print(
+            "[warning] Yahoo Finance rate limit reached while downloading prices/volumes. "
+            "Using cached database data where possible."
+        )
+    return pd.DataFrame()
+
+
+def fetch_ticker_info_with_retry(ticker: str) -> Tuple[Dict[str, Any], bool]:
+    last_rate_limit = False
+    for attempt in range(int(YF_TICKER_INFO_MAX_RETRIES)):
+        try:
+            info = yf.Ticker(ticker).get_info() or {}
+            return info, False
+        except YFRateLimitError:
+            last_rate_limit = True
+            if attempt < int(YF_TICKER_INFO_MAX_RETRIES) - 1:
+                time.sleep(float(YF_TICKER_INFO_BACKOFF_SECONDS) * float(attempt + 1))
+        except Exception:
+            if attempt < int(YF_TICKER_INFO_MAX_RETRIES) - 1:
+                time.sleep(0.25 * float(attempt + 1))
+    return {}, last_rate_limit
+
+
 def download_market_data_from_yfinance(tickers: Tuple[str, ...], start: str, end: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if not tickers:
         return pd.DataFrame(), pd.DataFrame()
 
-    end_plus_one = (pd.Timestamp(end) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    raw = yf.download(
-        tickers=list(tickers),
-        start=start,
-        end=end_plus_one,
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-    )
+    raw = download_raw_from_yfinance_with_retry(tickers=tickers, start=start, end=end)
 
     if raw.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -790,6 +864,40 @@ def download_market_data_from_yfinance(tickers: Tuple[str, ...], start: str, end
     volume.columns = [str(col).upper() for col in volume.columns]
     close = close.sort_index().dropna(how="all")
     volume = volume.sort_index().dropna(how="all")
+
+    requested_end = pd.Timestamp(end).normalize()
+    today_local = pd.Timestamp(date.today()).normalize()
+    if not close.empty and requested_end >= today_local:
+        last_dt = pd.Timestamp(close.index.max()).normalize()
+        if last_dt == requested_end:
+            aligned_volume = volume.reindex(index=close.index, columns=close.columns)
+            active_lookback = close.tail(min(60, len(close.index)))
+            active_mask = (active_lookback > 0).any(axis=0)
+            active_cols = active_mask[active_mask].index.tolist()
+            if active_cols:
+                last_close_cov = float(close.loc[last_dt, active_cols].notna().mean())
+                last_volume_cov = float(aligned_volume.loc[last_dt, active_cols].notna().mean())
+
+                if len(close.index) > 1:
+                    prev_dt = pd.Timestamp(close.index[-2]).normalize()
+                    prev_close_cov = float(close.loc[prev_dt, active_cols].notna().mean())
+                    prev_volume_cov = float(aligned_volume.loc[prev_dt, active_cols].notna().mean())
+                else:
+                    prev_close_cov = 1.0
+                    prev_volume_cov = 1.0
+
+                close_incomplete = (
+                    last_close_cov < INCOMPLETE_DAY_MIN_CLOSE_COVERAGE
+                    and last_close_cov < prev_close_cov * INCOMPLETE_DAY_RELATIVE_COVERAGE
+                )
+                volume_incomplete = (
+                    last_volume_cov < INCOMPLETE_DAY_MIN_VOLUME_COVERAGE
+                    and last_volume_cov < prev_volume_cov * INCOMPLETE_DAY_RELATIVE_COVERAGE
+                )
+                if close_incomplete or volume_incomplete:
+                    close = close.loc[close.index < last_dt]
+                    volume = volume.loc[volume.index < last_dt]
+
     return close, volume
 
 
@@ -811,12 +919,19 @@ def fetch_fundamentals_from_yfinance(tickers: Tuple[str, ...]) -> pd.DataFrame:
 
     asof_date = pd.Timestamp.utcnow().tz_localize(None).normalize().strftime("%Y-%m-%d")
     rows: List[Dict[str, Any]] = []
+    rate_limited = False
     for ticker in tickers:
-        info: Dict[str, Any] = {}
-        try:
-            info = yf.Ticker(ticker).get_info() or {}
-        except Exception:
+        info: Dict[str, Any]
+        if rate_limited:
             info = {}
+        else:
+            info, hit_rate_limit = fetch_ticker_info_with_retry(ticker)
+            if hit_rate_limit:
+                rate_limited = True
+                print(
+                    "[warning] Yahoo Finance rate limit reached while downloading fundamentals. "
+                    "Using cached fundamentals where available."
+                )
 
         rows.append(
             {
@@ -1260,17 +1375,34 @@ def download_price_volume_data(tickers: Tuple[str, ...], start: str, end: str) -
         db_prices = read_prices_from_database(conn, normalized_tickers, start_date, end_date)
         db_volumes = read_volumes_from_database(conn, normalized_tickers, start_date, end_date)
 
-        # Safety pass: if any ticker is still fully missing in-range for either field, retry once.
-        missing_in_range = [
-            ticker
-            for ticker in normalized_tickers
-            if (ticker not in db_prices.columns or db_prices[ticker].dropna().empty)
-            or (ticker not in db_volumes.columns or db_volumes[ticker].dropna().empty)
-        ]
-        if missing_in_range:
-            retry_prices, retry_volumes = download_market_data_from_yfinance(tuple(sorted(set(missing_in_range))), start, end)
+        def has_missing_or_stale_tail(ticker: str) -> bool:
+            if ticker not in db_prices.columns or ticker not in db_volumes.columns:
+                return True
+            close_non_na = db_prices[ticker].dropna()
+            volume_non_na = db_volumes[ticker].dropna()
+            if close_non_na.empty or volume_non_na.empty:
+                return True
+            last_close = pd.Timestamp(close_non_na.index[-1]).normalize()
+            last_volume = pd.Timestamp(volume_non_na.index[-1]).normalize()
+            cutoff = (end_date - coverage_tolerance).normalize()
+            return bool(last_close < cutoff or last_volume < cutoff)
+
+        # Safety pass: retry symbols that are either fully missing or have a stale trailing tail.
+        retry_candidates = sorted([ticker for ticker in normalized_tickers if has_missing_or_stale_tail(ticker)])
+        if retry_candidates:
+            retry_prices, retry_volumes = download_market_data_from_yfinance(tuple(retry_candidates), start, end)
             if not retry_prices.empty:
                 upsert_prices_into_database(conn, retry_prices, volumes=retry_volumes)
+            db_prices = read_prices_from_database(conn, normalized_tickers, start_date, end_date)
+            db_volumes = read_volumes_from_database(conn, normalized_tickers, start_date, end_date)
+
+            # Final per-ticker direct retry for symbols still stale after the batch retry.
+            still_stale = [ticker for ticker in retry_candidates if has_missing_or_stale_tail(ticker)]
+            for ticker in still_stale:
+                single_prices, single_volumes = download_market_data_from_yfinance((ticker,), start, end)
+                if not single_prices.empty:
+                    upsert_prices_into_database(conn, single_prices, volumes=single_volumes)
+            if still_stale:
                 db_prices = read_prices_from_database(conn, normalized_tickers, start_date, end_date)
                 db_volumes = read_volumes_from_database(conn, normalized_tickers, start_date, end_date)
 
@@ -4379,16 +4511,14 @@ def render_backtest_page() -> None:
                     st.caption(f"Fundamental data coverage: {coverage_summary}.")
     if limited_history_tickers:
         st.info(
-            f"{len(limited_history_tickers)} ticker(s) have limited positive-price history (often IPO/new listing) and were kept in the test. "
-            f"Post-last-price dates are treated as price=0 only after {DELISTING_CONFIRMATION_DAYS} consecutive missing trading days "
-            f"(delisting assumption): "
+            f"{len(limited_history_tickers)} ticker(s) have limited positive-price history (often IPO/new listing) and were kept in the test: "
             f"{', '.join(limited_history_tickers[:40])}{'...' if len(limited_history_tickers) > 40 else ''}"
         )
-    else:
-        st.caption(
-            f"Delisting assumption enabled: if a ticker has >= {DELISTING_CONFIRMATION_DAYS} consecutive missing trading days "
-            "after its last observed price, later dates are treated as price=0."
-        )
+    st.caption(
+        f"Delisting safeguard: a ticker is only treated as delisted if it stops reporting prices for "
+        f">= {DELISTING_CONFIRMATION_DAYS} consecutive trading days after its last observed price. "
+        "Pre-IPO leading gaps are not treated as delisting."
+    )
 
     st.subheader("Performance")
     render_metrics_table(strategy_returns, strategy_equity, benchmark_results)
@@ -4665,11 +4795,14 @@ def render_live_signals_page() -> None:
                     st.caption(f"Fundamental data coverage: {coverage_summary}.")
     if limited_history_tickers:
         st.info(
-            f"{len(limited_history_tickers)} ticker(s) have limited positive-price history (often IPO/new listing). "
-            f"For scan continuity, post-last-price dates are treated as price=0 only after "
-            f"{DELISTING_CONFIRMATION_DAYS} consecutive missing trading days: "
+            f"{len(limited_history_tickers)} ticker(s) have limited positive-price history (often IPO/new listing): "
             f"{', '.join(limited_history_tickers[:40])}{'...' if len(limited_history_tickers) > 40 else ''}"
         )
+    st.caption(
+        f"Delisting safeguard: a ticker is only treated as delisted if it stops reporting prices for "
+        f">= {DELISTING_CONFIRMATION_DAYS} consecutive trading days after its last observed price. "
+        "Pre-IPO leading gaps are not treated as delisting."
+    )
 
     try:
         base_long_weights = build_strategy_weights(strategy_name, prices, params)
