@@ -71,16 +71,16 @@ A Streamlit app for backtesting common quantitative equity strategies with user-
 ## Run
 ```bash
 pip install -r requirements.txt
-# Optional: use a cloud Postgres DB (Supabase/Neon free tiers)
+# Optional: use a cloud Postgres DB
 # PowerShell: $env:DATABASE_URL='postgresql://...'
 # bash: export DATABASE_URL='postgresql://...'
 streamlit run app.py
 ```
 
-## Cloud Database (Free Tier)
-You can move from local `data/price_history.sqlite3` to a free cloud Postgres DB.
+## Cloud Database
+You can move from local `data/price_history.sqlite3` to a cloud Postgres DB.
 
-1. Create a free Postgres database (for example Supabase or Neon).
+1. Create a Postgres database in your preferred environment.
 2. Copy its connection string (`postgresql://...`).
 3. Set `DATABASE_URL` in your environment.
 4. Migrate your existing SQLite data:
