@@ -900,15 +900,16 @@ def get_price_database_connection() -> Any:
                 "DATABASE_URL is set but psycopg is not installed. "
                 "Install dependencies with: pip install -r requirements.txt"
             ) from exc
+        connect_kwargs = {"connect_timeout": 15, "prepare_threshold": None}
         try:
-            return psycopg.connect(normalized_url, connect_timeout=15)
+            return psycopg.connect(normalized_url, **connect_kwargs)
         except psycopg.OperationalError as exc:
             error_text = str(exc)
             should_retry_ipv4 = "Cannot assign requested address" in error_text
             if should_retry_ipv4:
                 retry_url = build_ipv4_retry_database_url(normalized_url)
                 if retry_url:
-                    return psycopg.connect(retry_url, connect_timeout=15)
+                    return psycopg.connect(retry_url, **connect_kwargs)
                 raise RuntimeError(
                     "Failed to connect to DATABASE_URL from this environment. "
                     "The DB endpoint appears IPv6-only. Use an IPv4-reachable host "
