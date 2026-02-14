@@ -3,11 +3,13 @@
 import re
 import io
 import os
+import socket
 import sqlite3
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import numpy as np
 import pandas as pd
@@ -740,6 +742,32 @@ def normalize_postgres_database_url(url: str) -> str:
     return url
 
 
+def add_or_replace_query_param(url: str, key: str, value: str) -> str:
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query[key] = value
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def build_ipv4_retry_database_url(url: str) -> str | None:
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if not hostname:
+        return None
+
+    port = int(parsed.port or 5432)
+    try:
+        addrinfo = socket.getaddrinfo(hostname, port, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return None
+
+    if not addrinfo:
+        return None
+
+    ipv4_addr = str(addrinfo[0][4][0])
+    return add_or_replace_query_param(url, "hostaddr", ipv4_addr)
+
+
 def sql_placeholder_list(length: int) -> str:
     if length < 1:
         raise ValueError("length must be at least 1")
@@ -872,7 +900,21 @@ def get_price_database_connection() -> Any:
                 "DATABASE_URL is set but psycopg is not installed. "
                 "Install dependencies with: pip install -r requirements.txt"
             ) from exc
-        return psycopg.connect(normalized_url, connect_timeout=15)
+        try:
+            return psycopg.connect(normalized_url, connect_timeout=15)
+        except psycopg.OperationalError as exc:
+            error_text = str(exc)
+            should_retry_ipv4 = "Cannot assign requested address" in error_text
+            if should_retry_ipv4:
+                retry_url = build_ipv4_retry_database_url(normalized_url)
+                if retry_url:
+                    return psycopg.connect(retry_url, connect_timeout=15)
+                raise RuntimeError(
+                    "Failed to connect to DATABASE_URL from this environment. "
+                    "The DB endpoint appears IPv6-only. Use an IPv4-reachable host "
+                    "or your provider's pooled connection string."
+                ) from exc
+            raise
 
     conn = sqlite3.connect(PRICE_DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")

@@ -90,6 +90,7 @@ python scripts/migrate_sqlite_to_postgres.py --source data/price_history.sqlite3
 ```
 
 After `DATABASE_URL` is set, the app reads/writes to cloud Postgres instead of the local SQLite file.
+If you deploy on Streamlit Community Cloud, use a DB endpoint that supports IPv4 (or a pooled connection string), because IPv6-only endpoints can fail to connect.
 
 ## Notes
 - Data source: Yahoo Finance via `yfinance`.
