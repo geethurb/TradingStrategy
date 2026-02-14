@@ -2,6 +2,7 @@
 
 import re
 import io
+import os
 import sqlite3
 import time
 from datetime import date, datetime, timedelta
@@ -77,6 +78,7 @@ INDEX_SOURCE_URLS = {
 }
 VANGUARD_HOLDINGS_API_TEMPLATE = "https://investor.vanguard.com/vmf/api/{fund_identifier}/portfolio-holding/stock.json"
 PRICE_DB_PATH = Path(__file__).resolve().parent / "data" / "price_history.sqlite3"
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_COVERAGE_TOLERANCE_DAYS = 3
 DB_REFRESH_LOOKBACK_DAYS = 7
 DELISTING_CONFIRMATION_DAYS = 20
@@ -728,6 +730,55 @@ def get_rebalance_dates(index: pd.DatetimeIndex, frequency: str) -> List[pd.Time
     return rebalance_dates
 
 
+def use_cloud_postgres_database() -> bool:
+    return bool(DATABASE_URL)
+
+
+def normalize_postgres_database_url(url: str) -> str:
+    if url.startswith("postgres://"):
+        return f"postgresql://{url[len('postgres://') :]}"
+    return url
+
+
+def sql_placeholder_list(length: int) -> str:
+    if length < 1:
+        raise ValueError("length must be at least 1")
+    placeholder = "%s" if use_cloud_postgres_database() else "?"
+    return ",".join([placeholder] * length)
+
+
+def sql_placeholder() -> str:
+    return "%s" if use_cloud_postgres_database() else "?"
+
+
+def adapt_sql_placeholders(query: str) -> str:
+    if not use_cloud_postgres_database():
+        return query
+    return query.replace("?", "%s")
+
+
+def read_sql_dataframe(conn: Any, query: str, params: List[Any] | Tuple[Any, ...] | None = None) -> pd.DataFrame:
+    if use_cloud_postgres_database():
+        with conn.cursor() as cursor:
+            cursor.execute(query, list(params) if params is not None else None)
+            if cursor.description is None:
+                return pd.DataFrame()
+            columns = [str(desc[0]) for desc in cursor.description]
+            rows = cursor.fetchall()
+        return pd.DataFrame(rows, columns=columns)
+    return pd.read_sql_query(query, conn, params=list(params) if params is not None else None)
+
+
+def execute_many(conn: Any, query: str, records: List[Tuple[Any, ...]]) -> None:
+    if not records:
+        return
+    if use_cloud_postgres_database():
+        with conn.cursor() as cursor:
+            cursor.executemany(query, records)
+        return
+    conn.executemany(query, records)
+
+
 def ensure_valid_sqlite_file(path: Path) -> Path | None:
     if not path.exists():
         return None
@@ -752,12 +803,27 @@ def ensure_valid_sqlite_file(path: Path) -> Path | None:
     return backup_path
 
 
+def get_table_columns(conn: Any, table_name: str) -> set[str]:
+    if use_cloud_postgres_database():
+        query = (
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = %s"
+        )
+        rows = read_sql_dataframe(conn, query, params=[table_name])
+        if rows.empty or "column_name" not in rows.columns:
+            return set()
+        return {str(value).lower() for value in rows["column_name"].tolist()}
+    return {str(row[1]).lower() for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+
+
 def init_price_database() -> None:
-    PRICE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    moved_path = ensure_valid_sqlite_file(PRICE_DB_PATH)
-    if moved_path is not None:
-        print(f"[warning] Replaced invalid database file '{PRICE_DB_PATH}' with new SQLite DB. Backup: '{moved_path}'.")
-    with sqlite3.connect(PRICE_DB_PATH, timeout=30) as conn:
+    if not use_cloud_postgres_database():
+        PRICE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        moved_path = ensure_valid_sqlite_file(PRICE_DB_PATH)
+        if moved_path is not None:
+            print(f"[warning] Replaced invalid database file '{PRICE_DB_PATH}' with new SQLite DB. Backup: '{moved_path}'.")
+
+    with get_price_database_connection() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS daily_prices (
@@ -769,7 +835,7 @@ def init_price_database() -> None:
             )
             """
         )
-        columns = {str(row[1]).lower() for row in conn.execute("PRAGMA table_info(daily_prices)").fetchall()}
+        columns = get_table_columns(conn, "daily_prices")
         if "volume" not in columns:
             conn.execute("ALTER TABLE daily_prices ADD COLUMN volume REAL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_prices_date ON daily_prices (date)")
@@ -791,7 +857,23 @@ def init_price_database() -> None:
         conn.commit()
 
 
-def get_price_database_connection() -> sqlite3.Connection:
+def get_price_database_connection() -> Any:
+    if use_cloud_postgres_database():
+        normalized_url = normalize_postgres_database_url(DATABASE_URL)
+        if not normalized_url.startswith("postgresql://"):
+            raise ValueError(
+                "DATABASE_URL must start with postgresql:// (or postgres://). "
+                f"Received: '{DATABASE_URL}'"
+            )
+        try:
+            import psycopg
+        except ImportError as exc:
+            raise RuntimeError(
+                "DATABASE_URL is set but psycopg is not installed. "
+                "Install dependencies with: pip install -r requirements.txt"
+            ) from exc
+        return psycopg.connect(normalized_url, connect_timeout=15)
+
     conn = sqlite3.connect(PRICE_DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
@@ -949,16 +1031,16 @@ def fetch_fundamentals_from_yfinance(tickers: Tuple[str, ...]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def read_fundamentals_from_database(conn: sqlite3.Connection, tickers: Tuple[str, ...]) -> pd.DataFrame:
+def read_fundamentals_from_database(conn: Any, tickers: Tuple[str, ...]) -> pd.DataFrame:
     if not tickers:
         return pd.DataFrame(columns=["asof_date", *FUNDAMENTAL_METRIC_ORDER, "quote_type"])
 
-    placeholders = ",".join(["?"] * len(tickers))
+    placeholders = sql_placeholder_list(len(tickers))
     query = (
         f"SELECT ticker, asof_date, trailing_pe, forward_pe, price_to_book, trailing_eps, forward_eps, quote_type "
         f"FROM fundamentals_snapshot WHERE ticker IN ({placeholders})"
     )
-    rows = pd.read_sql_query(query, conn, params=list(tickers))
+    rows = read_sql_dataframe(conn, query, params=list(tickers))
     if rows.empty:
         return pd.DataFrame(columns=["asof_date", *FUNDAMENTAL_METRIC_ORDER, "quote_type"], index=pd.Index([], name="ticker"))
 
@@ -971,7 +1053,7 @@ def read_fundamentals_from_database(conn: sqlite3.Connection, tickers: Tuple[str
     return rows.reindex(list(tickers))
 
 
-def upsert_fundamentals_into_database(conn: sqlite3.Connection, fundamentals: pd.DataFrame) -> int:
+def upsert_fundamentals_into_database(conn: Any, fundamentals: pd.DataFrame) -> int:
     if fundamentals.empty:
         return 0
 
@@ -1004,7 +1086,7 @@ def upsert_fundamentals_into_database(conn: sqlite3.Connection, fundamentals: pd
     if not records:
         return 0
 
-    conn.executemany(
+    query = adapt_sql_placeholders(
         """
         INSERT INTO fundamentals_snapshot (
             ticker, asof_date, trailing_pe, forward_pe, price_to_book, trailing_eps, forward_eps, quote_type
@@ -1018,9 +1100,9 @@ def upsert_fundamentals_into_database(conn: sqlite3.Connection, fundamentals: pd
             trailing_eps = excluded.trailing_eps,
             forward_eps = excluded.forward_eps,
             quote_type = excluded.quote_type
-        """,
-        records,
+        """
     )
+    execute_many(conn, query, records)
     conn.commit()
     return len(records)
 
@@ -1146,18 +1228,18 @@ def filter_illiquid_stocks(
     return filtered_prices, illiquid_tickers, no_volume_tickers, True
 
 
-def get_data_bounds_from_database(conn: sqlite3.Connection, tickers: Tuple[str, ...], field: str) -> pd.DataFrame:
+def get_data_bounds_from_database(conn: Any, tickers: Tuple[str, ...], field: str) -> pd.DataFrame:
     if not tickers:
         return pd.DataFrame(columns=["ticker", "min_date", "max_date"])
     if field not in {"close", "volume"}:
         raise ValueError(f"Unsupported data field: {field}")
 
-    placeholders = ",".join(["?"] * len(tickers))
+    placeholders = sql_placeholder_list(len(tickers))
     query = (
         f"SELECT ticker, MIN(date) AS min_date, MAX(date) AS max_date "
         f"FROM daily_prices WHERE ticker IN ({placeholders}) AND {field} IS NOT NULL GROUP BY ticker"
     )
-    bounds = pd.read_sql_query(query, conn, params=list(tickers))
+    bounds = read_sql_dataframe(conn, query, params=list(tickers))
     if bounds.empty:
         return bounds
 
@@ -1167,12 +1249,12 @@ def get_data_bounds_from_database(conn: sqlite3.Connection, tickers: Tuple[str, 
     return bounds
 
 
-def get_price_bounds_from_database(conn: sqlite3.Connection, tickers: Tuple[str, ...]) -> pd.DataFrame:
+def get_price_bounds_from_database(conn: Any, tickers: Tuple[str, ...]) -> pd.DataFrame:
     return get_data_bounds_from_database(conn, tickers, field="close")
 
 
 def read_prices_from_database(
-    conn: sqlite3.Connection,
+    conn: Any,
     tickers: Tuple[str, ...],
     start_date: pd.Timestamp,
     end_date: pd.Timestamp,
@@ -1180,14 +1262,14 @@ def read_prices_from_database(
     if not tickers:
         return pd.DataFrame()
 
-    placeholders = ",".join(["?"] * len(tickers))
+    placeholders = sql_placeholder_list(len(tickers))
     query = (
         f"SELECT date, ticker, close FROM daily_prices "
-        f"WHERE ticker IN ({placeholders}) AND date BETWEEN ? AND ? "
+        f"WHERE ticker IN ({placeholders}) AND date BETWEEN {sql_placeholder()} AND {sql_placeholder()} "
         f"ORDER BY date"
     )
     params: List[str] = list(tickers) + [start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")]
-    rows = pd.read_sql_query(query, conn, params=params)
+    rows = read_sql_dataframe(conn, query, params=params)
     if rows.empty:
         return pd.DataFrame(columns=list(tickers))
 
@@ -1197,7 +1279,7 @@ def read_prices_from_database(
 
 
 def read_volumes_from_database(
-    conn: sqlite3.Connection,
+    conn: Any,
     tickers: Tuple[str, ...],
     start_date: pd.Timestamp,
     end_date: pd.Timestamp,
@@ -1205,14 +1287,14 @@ def read_volumes_from_database(
     if not tickers:
         return pd.DataFrame()
 
-    placeholders = ",".join(["?"] * len(tickers))
+    placeholders = sql_placeholder_list(len(tickers))
     query = (
         f"SELECT date, ticker, volume FROM daily_prices "
-        f"WHERE ticker IN ({placeholders}) AND date BETWEEN ? AND ? "
+        f"WHERE ticker IN ({placeholders}) AND date BETWEEN {sql_placeholder()} AND {sql_placeholder()} "
         f"ORDER BY date"
     )
     params: List[str] = list(tickers) + [start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")]
-    rows = pd.read_sql_query(query, conn, params=params)
+    rows = read_sql_dataframe(conn, query, params=params)
     if rows.empty:
         return pd.DataFrame(columns=list(tickers))
 
@@ -1248,7 +1330,7 @@ def apply_delisting_zero_assumption(prices: pd.DataFrame, confirmation_days: int
     return adjusted
 
 
-def upsert_prices_into_database(conn: sqlite3.Connection, prices: pd.DataFrame, volumes: pd.DataFrame | None = None) -> int:
+def upsert_prices_into_database(conn: Any, prices: pd.DataFrame, volumes: pd.DataFrame | None = None) -> int:
     if prices.empty:
         return 0
 
@@ -1267,16 +1349,16 @@ def upsert_prices_into_database(conn: sqlite3.Connection, prices: pd.DataFrame, 
         volume_db_value = float(volume_value) if pd.notna(volume_value) else None
         records.append((str(ticker).upper(), pd.Timestamp(dt).strftime("%Y-%m-%d"), float(close), volume_db_value))
 
-    conn.executemany(
+    query = adapt_sql_placeholders(
         """
         INSERT INTO daily_prices (ticker, date, close, volume)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(ticker, date) DO UPDATE SET
             close = excluded.close,
             volume = COALESCE(excluded.volume, daily_prices.volume)
-        """,
-        records,
+        """
     )
+    execute_many(conn, query, records)
     conn.commit()
     return len(records)
 

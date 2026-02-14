@@ -9,7 +9,7 @@ A Streamlit app for backtesting common quantitative equity strategies with user-
   - Major S&P 500 sector universes (Technology, Health Care, Financials, Industrials, etc.)
   - Custom ticker list input
 - Data layer:
-  - Incremental local SQLite price store at `data/price_history.sqlite3`
+  - Incremental price store (local SQLite by default, or cloud Postgres via `DATABASE_URL`)
   - Stores both daily close and daily volume (schema auto-upgrades if volume column was missing)
   - Stores per-ticker fundamental snapshots (P/E, P/B, EPS) with periodic refresh
   - Uses a unified fetch path for price+volume (single query/download pass) for efficiency
@@ -71,8 +71,25 @@ A Streamlit app for backtesting common quantitative equity strategies with user-
 ## Run
 ```bash
 pip install -r requirements.txt
+# Optional: use a cloud Postgres DB (Supabase/Neon free tiers)
+# PowerShell: $env:DATABASE_URL='postgresql://...'
+# bash: export DATABASE_URL='postgresql://...'
 streamlit run app.py
 ```
+
+## Cloud Database (Free Tier)
+You can move from local `data/price_history.sqlite3` to a free cloud Postgres DB.
+
+1. Create a free Postgres database (for example Supabase or Neon).
+2. Copy its connection string (`postgresql://...`).
+3. Set `DATABASE_URL` in your environment.
+4. Migrate your existing SQLite data:
+
+```bash
+python scripts/migrate_sqlite_to_postgres.py --source data/price_history.sqlite3
+```
+
+After `DATABASE_URL` is set, the app reads/writes to cloud Postgres instead of the local SQLite file.
 
 ## Notes
 - Data source: Yahoo Finance via `yfinance`.
